@@ -1,0 +1,79 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://config.boppa.app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Validate iOS.json
+        run: |
+          node -e '
+            const config = JSON.parse(require("fs").readFileSync("iOS.json", "utf8"));
+            const urls = config.defaultMediaSources;
+            const problems = [];
+            if (config.format !== 1) problems.push("format must be 1");
+            if (!Array.isArray(urls)) problems.push("defaultMediaSources must be an array");
+            else {
+              if (new Set(urls).size !== urls.length) problems.push("defaultMediaSources has duplicates");
+              for (const url of urls) {
+                if (!/^https:\/\/.+\.boppa$/.test(url)) problems.push(`invalid package URL: ${url}`);
+              }
+            }
+            for (const key of Object.keys(config)) {
+              if (key !== "format" && key !== "defaultMediaSources") problems.push(`unknown field: ${key}`);
+            }
+            if (problems.length > 0) {
+              for (const problem of problems) console.error(`::error::iOS.json: ${problem}`);
+              process.exit(1);
+            }
+          '
+      - name: Build
+        run: |
+          mkdir dist
+          cp iOS.json dist/
+      - name: Check Cloudflare settings
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_PAGES_PROJECT: ${{ vars.CLOUDFLARE_PAGES_PROJECT }}
+        run: |
+          missing=0
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "::error::Secret CLOUDFLARE_API_TOKEN is not set"; missing=1; }
+          [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || { echo "::error::Secret CLOUDFLARE_ACCOUNT_ID is not set"; missing=1; }
+          [ -n "$CLOUDFLARE_PAGES_PROJECT" ] || { echo "::error::Variable CLOUDFLARE_PAGES_PROJECT is not set (Settings > Secrets and variables > Actions > Variables)"; missing=1; }
+          exit $missing
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          wranglerVersion: "4.136.2"
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=${{ vars.CLOUDFLARE_PAGES_PROJECT }} --branch=main --commit-hash=${{ github.sha }}
+      - name: Check published config
+        run: |
+          # New files can 404 for a short while after deploy until the edge picks them up.
+          url="https://config.boppa.app/iOS.json"
+          for attempt in 1 2 3 4 5 6; do
+            curl -fsS -H "Cache-Control: no-cache" "$url" | cmp - iOS.json && break
+            [ "$attempt" -lt 6 ] || exit 1
+            echo "Retrying $url in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
